@@ -106,6 +106,27 @@ class DataConfig:
     # Maps frame_idx to step via floor-division: step = (frame_idx // fg_stride) * fg_stride.
     fg_stride: int | None = None
 
+    # Multi-root raw-LeRobot mode (Method-1 aug training; robocasa_lerobot_multiroot.py).
+    # When non-empty, the dataset is the concat of every */lerobot root under these
+    # base dirs (mp4-backed, no packed/npz needed); repo_id is only used as a label.
+    dataset_base_dirs: Sequence[str] = ()
+    # dense_annotator output file: meta/captions_<slug>.jsonl in each root.
+    caption_model_slug: str = "Qwen3-VL-30B-A3B-Instruct"
+    # mix5-style per-access sampling, e.g. "none,current_action,environment-simple,
+    # agent_arm_state,reasoning-short" ("none" = task-description only).
+    caption_sample_keys: str | None = None
+    # Mode-A: when set, append primitive (segment, instruction) samples read from
+    # meta/primitives_<slug>_clean.jsonl in each root (primitive_dataset.py).
+    primitive_slug: str | None = None
+    primitive_repeat: int = 1
+    primitive_only: bool = False
+
+    # I1b anchor target (multiroot mode). When non-empty, the loader fetches a longer
+    # action window and attaches observation.ee_physics_target for the anchor aux head.
+    # Populated from the model config in LeRobotRoboCasaDataConfig.create.
+    anchor_horizons: tuple[int, ...] = ()
+    anchor_pos_slice: tuple[int, int] = (0, 3)
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -415,6 +436,13 @@ class LeRobotRoboCasaDataConfig(DataConfigFactory):
     # Stride (in frames) between fine-grained caption steps.
     fg_stride: int | None = None
 
+    # Multi-root raw-LeRobot mode (see DataConfig.dataset_base_dirs).
+    dataset_base_dirs: Sequence[str] = ()
+    caption_sample_keys: str | None = None
+    primitive_slug: str | None = None
+    primitive_repeat: int = 1
+    primitive_only: bool = False
+
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repack_keys = {
@@ -429,6 +457,13 @@ class LeRobotRoboCasaDataConfig(DataConfigFactory):
         }
         if self.include_reasoning:
             repack_keys["reasoning_text"] = "reasoning_text"
+        # I1b anchor: enable when the model config carries anchor_aux_weight > 0. The
+        # loader-side AnchorTarget produces observation.ee_physics_target; keep it
+        # through the repack so it reaches Observation.from_dict.
+        anchor_horizons: tuple[int, ...] = ()
+        if getattr(model_config, "anchor_aux_weight", 0.0) > 0.0:
+            anchor_horizons = tuple(getattr(model_config, "anchor_horizons_frames", ()))
+            repack_keys["ee_physics_target"] = "ee_physics_target"
 
         repack_transform = _transforms.Group(
             inputs=[_transforms.RepackTransform(repack_keys)]
@@ -449,6 +484,13 @@ class LeRobotRoboCasaDataConfig(DataConfigFactory):
             action_sequence_keys=("action",),
             caption_key=self.caption_key,
             fg_stride=self.fg_stride,
+            dataset_base_dirs=tuple(self.dataset_base_dirs),
+            caption_sample_keys=self.caption_sample_keys,
+            primitive_slug=self.primitive_slug,
+            primitive_repeat=self.primitive_repeat,
+            primitive_only=self.primitive_only,
+            anchor_horizons=anchor_horizons,
+            anchor_pos_slice=tuple(getattr(model_config, "anchor_pos_slice", (0, 3))),
         )
 
 
@@ -713,6 +755,406 @@ _CONFIGS: list["TrainConfig"] = [
         num_train_steps=30_000,
         save_interval=2000,
         keep_period=5000,
+    ),
+    # ------------------------------------------------------------------
+    # Language x initial-state-augmentation study (2026-07): fine-tune the
+    # released DeMiAn-VLA on the composite atomic split, +/- Method-1
+    # front-buffer augmentation, with mix5 caption sampling. Trains directly
+    # off the raw mp4 lerobot roots (robocasa_lerobot_multiroot.py). The two
+    # configs differ ONLY in dataset_base_dirs — matched budget/init/captions.
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_robocasa_lm_composite",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_composite_multiroot",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/demian/DeMiAn-VLA/openpi",
+        num_train_steps=20_000,
+        save_interval=2000,
+        keep_period=5000,
+        num_workers=16,
+    ),
+    # ------------------------------------------------------------------
+    # CURRICULUM Stage 1 — primitive PRETRAIN from openpi-0.5 base.
+    #   pi05_base -> [primitive] -> atomic -> composite (stages 2,3 continue
+    #   from this checkpoint). Trains on primitive (segment, instruction) pairs
+    #   ONLY (primitive_only), so the base model learns the low-level
+    #   primitive-instruction -> action vocabulary before task specialization.
+    #   Checkpoint every 2k so we can read the trend on atomic + composite.
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_robocasa_prim_pretrain",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_prim_pretrain",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+            ),
+            primitive_slug="Qwen3-VL-30B-A3B-Instruct",
+            primitive_only=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/pi05_base_pytorch",
+        num_train_steps=12_000,
+        save_interval=2000,
+        keep_period=2000,
+        num_workers=16,
+    ),
+    # ------------------------------------------------------------------
+    # Mode-A PRIMITIVE arm: DeMiAn-VLA init + composite_atomic_split (mix5
+    # captions) + PRIMITIVE (segment, instruction) pairs where the primitive
+    # imperative is the prompt. The training-side attack on the commitment
+    # bottleneck (analysis Part 5): teaches primitive-instruction -> action so
+    # an S2 instructor can steer mid-subtask. = the ctrl config + primitive_slug.
+    # Judge on the primitive-following probe + instructor-mode SR, NOT oracle SR.
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_robocasa_lm_prim",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_composite_multiroot_prim",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+            primitive_slug="Qwen3-VL-30B-A3B-Instruct",
+            primitive_repeat=25,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/demian/DeMiAn-VLA/openpi",
+        num_train_steps=20_000,
+        save_interval=2000,
+        keep_period=5000,
+        num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_lm_composite_aug",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_composite_multiroot_aug",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split_aug_v2",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/demian/DeMiAn-VLA/openpi",
+        num_train_steps=20_000,
+        save_interval=2000,
+        keep_period=5000,
+        num_workers=16,
+    ),
+    # ------------------------------------------------------------------
+    # SOTA-chase arm: the aug arm + BOTH proven auxiliary losses stacked.
+    #   - I1a (deriv_aux 0.1): derivative/Sobolev on the flow head's implied
+    #     clean action — the promoted, zero-param, no-inference-change win.
+    #   - physics_aux (0.1): in-batch future-state summary off the action
+    #     expert (I1b's within-chunk portion; aux-target delivery = the SAFE
+    #     mode per phase4-report, +7.3pp atomic). Both are "predict/match"
+    #     losses, not output constraints, so mode-collapse risk is low; the
+    #     time-weight on I1a keeps it benign on the flow head.
+    # The still-running aug arm (no aux) is the free ablation anchor:
+    # this arm minus that one isolates (I1a + physics_aux).
+    # ------------------------------------------------------------------
+    TrainConfig(
+        name="pi05_robocasa_lm_composite_aug_i1",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+            deriv_aux_weight=0.1, deriv_action_slice=(0, 6),
+            physics_aux_weight=0.1,
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_composite_multiroot_aug_i1",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split_aug_v2",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/demian/DeMiAn-VLA/openpi",
+        num_train_steps=20_000,
+        save_interval=2000,
+        keep_period=5000,
+        num_workers=16,
+    ),
+    # ==================================================================
+    # CURRICULUM with I1b future-state anchor aux (hierarchy's composite-proven
+    # lever, +6.5pp -dynamic p=0.00073). anchor_aux_weight>0 -> the loader fetches
+    # a 161-frame action window and attaches observation.ee_physics_target; the
+    # anchor head off pooled suffix latents regresses cumulative EEF-pos
+    # displacement at {5,10,20,40,80,160}. Never read at inference. Curriculum:
+    # Stage 1 primitive pretrain (no anchor; segments too short) is a SEPARATE
+    # config already running -> its final ckpt inits Stage 2 (atomic) -> Stage 3
+    # (composite). anchor_target_mean/std left empty until compute_anchor_stats.py.
+    # ==================================================================
+    TrainConfig(
+        name="pi05_robocasa_atomic_i1b",  # Stage 2: atomic (init from Stage-1 primitive)
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+            anchor_aux_weight=0.1,
+            # z-stats from compute_anchor_stats.py (composite; atomic ~ same action space).
+            anchor_target_mean=(-0.00644, 0.04620, -0.04763, -0.09077, -0.00220, -0.02313, -0.27981, -0.17047, 0.03344, 0.00190, -0.80571, -0.42820, 1.88683, -1.44289, -1.78842, 1.70492, -2.21208, -2.06273),
+            anchor_target_std=(1.50391, 1.59244, 1.48343, 2.95065, 3.16610, 2.96658, 5.54637, 5.89488, 5.51407, 9.88085, 10.99075, 9.85736, 13.65520, 18.87670, 14.42240, 20.08450, 27.36267, 20.46720),
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_atomic_i1b",
+            assets=AssetsConfig(
+                # Reuse composite norm_stats across all curriculum stages so the action
+                # normalization is consistent from primitive -> atomic -> composite
+                # (same 16-dim state / 7-dim EEF action space; atomic range ⊂ composite).
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/robocasa_atomic_navfiltered",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/curriculum/stage1_prim",  # Stage-1 final; set by the gate
+        num_train_steps=30_000,
+        save_interval=5000,
+        keep_period=10000,
+        num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_composite_i1b",  # Stage 3: composite (init from Stage-2 atomic)
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+            anchor_aux_weight=0.1,
+            # z-stats from compute_anchor_stats.py over composite_atomic_split.
+            anchor_target_mean=(-0.00644, 0.04620, -0.04763, -0.09077, -0.00220, -0.02313, -0.27981, -0.17047, 0.03344, 0.00190, -0.80571, -0.42820, 1.88683, -1.44289, -1.78842, 1.70492, -2.21208, -2.06273),
+            anchor_target_std=(1.50391, 1.59244, 1.48343, 2.95065, 3.16610, 2.96658, 5.54637, 5.89488, 5.51407, 9.88085, 10.99075, 9.85736, 13.65520, 18.87670, 14.42240, 20.08450, 27.36267, 20.46720),
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_composite_i1b",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/curriculum/stage2_atomic",  # Stage-2 final; set by the gate
+        num_train_steps=20_000,
+        save_interval=2000,
+        keep_period=5000,
+        num_workers=16,
+    ),
+    # ==================================================================
+    # COMBINED "everything" curriculum (jeju-2): every positive lever stacked —
+    # curriculum (pi05_base -> primitive -> atomic -> composite) + I1a (deriv/Sobolev,
+    # deriv_aux 0.1) on ALL stages + I1b (future-state anchor 0.1) on atomic+composite.
+    # Runs alongside the I1b-only curriculum (jeju-3/jeju-0) and the I1b-standalone arm
+    # (ssc-3) -> an ablation ladder: I1b-standalone / curriculum+I1b / curriculum+I1a+I1b.
+    # ==================================================================
+    TrainConfig(
+        name="pi05_robocasa_prim_i1a",  # Stage 1 combined: primitive pretrain + I1a
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+            deriv_aux_weight=0.1, deriv_action_slice=(0, 6),
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_prim_i1a",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+            ),
+            primitive_slug="Qwen3-VL-30B-A3B-Instruct",
+            primitive_only=True,
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/pi05_base_pytorch",
+        num_train_steps=12_000,
+        save_interval=2000,
+        keep_period=2000,
+        num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_atomic_i1ab",  # Stage 2 combined: atomic + I1a + I1b
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+            deriv_aux_weight=0.1, deriv_action_slice=(0, 6),
+            anchor_aux_weight=0.1,
+            anchor_target_mean=(-0.00644, 0.04620, -0.04763, -0.09077, -0.00220, -0.02313, -0.27981, -0.17047, 0.03344, 0.00190, -0.80571, -0.42820, 1.88683, -1.44289, -1.78842, 1.70492, -2.21208, -2.06273),
+            anchor_target_std=(1.50391, 1.59244, 1.48343, 2.95065, 3.16610, 2.96658, 5.54637, 5.89488, 5.51407, 9.88085, 10.99075, 9.85736, 13.65520, 18.87670, 14.42240, 20.08450, 27.36267, 20.46720),
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_atomic_i1ab",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/robocasa_atomic_navfiltered",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/curriculum_i1ab/stage1",  # Stage-1 final; set by the gate
+        num_train_steps=30_000,
+        save_interval=5000,
+        keep_period=10000,
+        num_workers=16,
+    ),
+    TrainConfig(
+        name="pi05_robocasa_composite_i1ab",  # Stage 3 combined: composite + I1a + I1b
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=10, discrete_state_input=False,
+            max_token_len=384, lm_loss_weight=0.1,
+            deriv_aux_weight=0.1, deriv_action_slice=(0, 6),
+            anchor_aux_weight=0.1,
+            anchor_target_mean=(-0.00644, 0.04620, -0.04763, -0.09077, -0.00220, -0.02313, -0.27981, -0.17047, 0.03344, 0.00190, -0.80571, -0.42820, 1.88683, -1.44289, -1.78842, 1.70492, -2.21208, -2.06273),
+            anchor_target_std=(1.50391, 1.59244, 1.48343, 2.95065, 3.16610, 2.96658, 5.54637, 5.89488, 5.51407, 9.88085, 10.99075, 9.85736, 13.65520, 18.87670, 14.42240, 20.08450, 27.36267, 20.46720),
+        ),
+        data=LeRobotRoboCasaDataConfig(
+            repo_id="robocasa_composite_i1ab",
+            assets=AssetsConfig(
+                asset_id="robocasa_composite_split",
+                assets_dir="/home/bkim/demian/openpi/assets/robocasa_composite",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            include_reasoning=True,
+            dataset_base_dirs=(
+                "/home/bkim/orchest_data/robocasa_v1.0/composite_atomic_split",
+            ),
+            caption_sample_keys="none,current_action,environment-simple,agent_arm_state,reasoning-short",
+        ),
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="/home/bkim/ckpts/curriculum_i1ab/stage2",  # Stage-2 final; set by the gate
+        num_train_steps=20_000,
+        save_interval=2000,
+        keep_period=5000,
+        num_workers=16,
     ),
 ]
 

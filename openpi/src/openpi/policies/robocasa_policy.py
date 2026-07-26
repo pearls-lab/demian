@@ -53,6 +53,10 @@ class RoboCasaInputs(transforms.DataTransformFn):
         if "actions" in data:
             inputs["actions"] = data["actions"]
 
+        # I1b anchor target (train only): [n_horizons, 4] = (3 disp + 1 mask).
+        if "ee_physics_target" in data:
+            inputs["ee_physics_target"] = data["ee_physics_target"]
+
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 

@@ -142,7 +142,8 @@ def create_torch_dataset(
 
     # EgoVerse LM-only pre-training dispatch. The `repo_id` is the episodes root
     # directory and `egoverse_manifest_path` is the stage1 manifest JSON-lines file.
-    if data_config.egoverse_manifest_path is not None:
+    # (getattr: the release DataConfig dropped the egoverse fields but kept this path.)
+    if getattr(data_config, "egoverse_manifest_path", None) is not None:
         from openpi.training.egoverse_dataset import EgoVerseDataset
 
         logging.info(
@@ -157,6 +158,23 @@ def create_torch_dataset(
             action_dim=model_config.action_dim,
             state_dim=model_config.action_dim,
             random_frames=data_config.egoverse_random_frames,
+        )
+
+    # Multi-root raw-LeRobot mode (Method-1 aug: source split + aug clips concat).
+    if data_config.dataset_base_dirs:
+        from openpi.training.robocasa_lerobot_multiroot import build_multiroot_dataset
+
+        return build_multiroot_dataset(
+            base_dirs=tuple(data_config.dataset_base_dirs),
+            action_horizon=action_horizon,
+            action_sequence_keys=tuple(data_config.action_sequence_keys),
+            caption_model_slug=data_config.caption_model_slug,
+            caption_sample_keys=data_config.caption_sample_keys,
+            primitive_slug=data_config.primitive_slug,
+            primitive_repeat=data_config.primitive_repeat,
+            primitive_only=data_config.primitive_only,
+            anchor_horizons=tuple(data_config.anchor_horizons),
+            anchor_pos_slice=tuple(data_config.anchor_pos_slice),
         )
 
     # If repo_id is an absolute path, check if pre-extracted images or packed npz exist for fast loading.

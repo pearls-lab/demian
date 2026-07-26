@@ -695,6 +695,8 @@ def train_loop(config: _config.TrainConfig):
                     "vae_kl",
                     "next_state_loss",
                     "latent_loss",
+                    "deriv_loss",
+                    "anchor_loss",
                 )
                 for key in _extra_keys:
                     if any(key in info for info in infos):
@@ -703,7 +705,7 @@ def train_loop(config: _config.TrainConfig):
                         )
                 if "moe_aux_loss" in avg_extra_losses:
                     log_parts.append(f"moe_aux={avg_extra_losses['moe_aux_loss']:.4f}")
-                for _aux_key in ("physics_loss", "pair_physics_loss", "next_state_loss", "latent_loss", "vae_recon", "vae_kl"):
+                for _aux_key in ("physics_loss", "pair_physics_loss", "next_state_loss", "latent_loss", "vae_recon", "vae_kl", "deriv_loss", "anchor_loss"):
                     if _aux_key in avg_extra_losses:
                         log_parts.append(f"{_aux_key}={avg_extra_losses[_aux_key]:.4f}")
                 log_parts.append(f"lr={avg_lr:.2e}")

@@ -97,6 +97,16 @@ class Pi0Config(_model.BaseModelConfig):
     # "molmobot_joint_delta" uses 7 cumulative joint deltas + gripper transition
     # + joint-space curvature and speed.
     physics_aux_action_layout: str = "robocasa_ee"
+    # I1a — derivative/Sobolev auxiliary loss on the flow head's implied clean
+    # action (a_hat = x_t - t*v_t). Finite-diff vel/accel matching vs the GT
+    # chunk on the EEF slice only. No new params, no inference change. 0 disables.
+    # (hierarchy/docs/phase4-i1-integration.md §3; the promoted Phase-2 win.)
+    deriv_aux_weight: float = 0.0
+    # EEF sub-slice of the (already 7-dim, then padded) action vector: pos+rot.
+    # Gripper (index 6) is an event channel and is excluded from smoothing.
+    deriv_action_slice: tuple[int, int] = (0, 6)
+    deriv_lv: float = 1.0  # 1st-derivative (velocity) weight
+    deriv_la: float = 0.5  # 2nd-derivative (acceleration) weight
     # Pairwise physics regression head: predicts interval-level motion geometry
     # for every sub-trajectory inside the action chunk. 0 disables.
     pair_physics_aux_weight: float = 0.0
@@ -113,6 +123,25 @@ class Pi0Config(_model.BaseModelConfig):
     next_state_aux_weight: float = 0.0
     # Robot state dim for next_state_aux. Robocasa = 16. Override per benchmark.
     next_state_aux_dim: int = 16
+
+    # ---- I1b future-state anchor head (ported from hierarchy/openpi-navfilt) ----
+    # Aux head off pooled suffix latents -> cumulative EEF-position displacement at
+    # multiple future horizons (frames). NOT fed to the action head; never read at
+    # inference (the "predict the future, don't consume it" delivery that beat the
+    # decoded-constraint/input variants in both projects). 0 disables -> byte-identical.
+    # The target is computed IN-BATCH from a future-action window fetched by the
+    # multiroot loader (no global-index .npy), z-scored per (horizon, dim), and
+    # delivered as observation.ee_physics_target = [n_horizons, 4] (3 disp + 1 mask).
+    anchor_aux_weight: float = 0.0
+    # Future horizons (frames) for the anchor head. RoboCasa is 20 fps.
+    anchor_horizons_frames: tuple[int, ...] = (5, 10, 20, 40, 80, 160)
+    # EEF Δpos dims in the (7-dim effective) action vector: action[5:12] -> pos = [0,3).
+    anchor_pos_slice: tuple[int, int] = (0, 3)
+    # Per-(horizon, dim) z-score stats of the raw cumulative displacement target,
+    # flat n_horizons*3 each. Empty -> targets used un-normalized (far horizons will
+    # dominate); set from scripts/compute_anchor_stats.py for scale-balanced horizons.
+    anchor_target_mean: tuple[float, ...] = ()
+    anchor_target_std: tuple[float, ...] = ()
 
     # ---- Two-stage latent aux (motion-physics VAE) ----
     # When > 0, attach a head that predicts a Stage-1-pretrained latent target

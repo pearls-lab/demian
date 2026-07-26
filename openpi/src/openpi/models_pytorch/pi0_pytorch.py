@@ -256,6 +256,25 @@ class PI0Pytorch(nn.Module):
                 nn.Linear(4 * d, config.next_state_aux_dim),
             )
 
+        # I1b future-state anchor head (ported from hierarchy/openpi-navfilt). Off the
+        # masked-mean-pooled suffix (action-token) latents -> cumulative EEF-pos
+        # displacement at n_horizons. Built only when the weight > 0 so weight=0
+        # configs are byte-identical to the released DeMiAn-VLA graph.
+        self.use_anchor_aux = getattr(config, "anchor_aux_weight", 0.0) > 0.0
+        if self.use_anchor_aux:
+            self._n_anchor = len(config.anchor_horizons_frames)
+            d = action_expert_config.width
+            self.anchor_head = nn.Sequential(
+                nn.Linear(d, 4 * d),
+                nn.SiLU(),
+                nn.Linear(4 * d, self._n_anchor * 3),
+            )
+            # Non-persistent z-score buffers (ride device/dtype, absent from ckpts).
+            _tm = torch.tensor(config.anchor_target_mean or [0.0] * (self._n_anchor * 3), dtype=torch.float32)
+            _ts = torch.tensor(config.anchor_target_std or [1.0] * (self._n_anchor * 3), dtype=torch.float32)
+            self.register_buffer("_anchor_tmean", _tm.reshape(self._n_anchor, 3), persistent=False)
+            self.register_buffer("_anchor_tstd", _ts.reshape(self._n_anchor, 3).clamp(min=1e-6), persistent=False)
+
         if config.latent_aux_weight > 0.0 and config.latent_aux_vae_path:
             from openpi.models.motion_physics_vae import MotionPhysicsVAE
 
@@ -602,6 +621,24 @@ class PI0Pytorch(nn.Module):
 
         flow_loss = F.mse_loss(u_t, v_t, reduction="none")
         flow_loss_mean = flow_loss.mean()
+
+        # ---- I1a: derivative (Sobolev) aux on the implied clean action ----
+        # a_hat = x_t - t*v_t is the model's implied clean action from this same
+        # forward pass (no extra params, no inference change). Match its 1st/2nd
+        # finite differences along the horizon to the GT chunk, on the EEF slice.
+        # Time-weighted by (1-t): a_hat is low-variance near t->0 and noisy near
+        # t->1, so weighting keeps the mean-seeking pressure benign on the flow
+        # head (phase4-i1-integration.md §3.1, §7 risk-1).
+        deriv_loss_weighted = torch.zeros((), device=flow_loss_mean.device, dtype=flow_loss_mean.dtype)
+        if getattr(self.config, "deriv_aux_weight", 0.0) > 0.0:
+            a_hat = x_t - time_expanded * v_t                              # (B,H,ad)
+            lo, hi = self.config.deriv_action_slice
+            yh, yt = a_hat[..., lo:hi], actions[..., lo:hi]
+            w = (1.0 - time).clamp(min=0.0)                                # (B,)
+            l1 = ((torch.diff(yh, dim=1) - torch.diff(yt, dim=1)) ** 2).mean(dim=(1, 2))
+            l2 = ((torch.diff(yh, n=2, dim=1) - torch.diff(yt, n=2, dim=1)) ** 2).mean(dim=(1, 2))
+            deriv_loss = (w * (self.config.deriv_lv * l1 + self.config.deriv_la * l2)).mean()
+            deriv_loss_weighted = self.config.deriv_aux_weight * deriv_loss
         moe_losses = self.paligemma_with_expert.moe_aux_loss()
         moe_aux_loss = (
             moe_losses["moe_aux_loss"]
@@ -613,6 +650,8 @@ class PI0Pytorch(nn.Module):
         # suffix_out here is (B, action_horizon, action_expert_width) — the action
         # expert's per-timestep hidden states, same tensor that feeds action_out_proj.
         aux_extra: dict[str, torch.Tensor] = {}
+        if getattr(self.config, "deriv_aux_weight", 0.0) > 0.0:
+            aux_extra["deriv_loss"] = deriv_loss
         physics_loss_weighted = torch.zeros((), device=flow_loss_mean.device, dtype=flow_loss_mean.dtype)
         pair_physics_loss_weighted = torch.zeros((), device=flow_loss_mean.device, dtype=flow_loss_mean.dtype)
         vae_loss_weighted = torch.zeros((), device=flow_loss_mean.device, dtype=flow_loss_mean.dtype)
@@ -743,6 +782,27 @@ class PI0Pytorch(nn.Module):
             next_state_loss_weighted = self.config.next_state_aux_weight * next_state_loss
             aux_extra["next_state_loss"] = next_state_loss
 
+        # --- I1b future-state anchor head ---
+        # Off the masked-mean-pooled suffix (action-token) latents -> cumulative
+        # EEF-pos displacement at n_horizons. NOT fed to the action head; never read
+        # at inference. Target delivered by the loader as observation.ee_physics_target
+        # = [B, n_anchor, 4] (3 raw cumulative-disp + 1 valid mask); z-scored here with
+        # the registered per-(horizon, dim) buffers so horizons contribute comparably.
+        anchor_loss_weighted = torch.zeros((), device=flow_loss_mean.device, dtype=flow_loss_mean.dtype)
+        if self.use_anchor_aux:
+            ee_target = getattr(observation, "ee_physics_target", None)
+            if ee_target is None:
+                raise ValueError("anchor_aux_weight>0 but observation.ee_physics_target is missing")
+            pooled_anchor = suffix_out.mean(dim=1)                                # (B, d)
+            anchor_pred = self.anchor_head(pooled_anchor).reshape(-1, self._n_anchor, 3)  # (B, n, 3)
+            tgt = ee_target.reshape(-1, self._n_anchor, 4).to(anchor_pred.dtype)
+            target = (tgt[..., :3] - self._anchor_tmean.to(anchor_pred.dtype)) / self._anchor_tstd.to(anchor_pred.dtype)
+            mask = tgt[..., 3:4]                                                  # (B, n, 1)
+            per = (anchor_pred - target) ** 2 * mask
+            anchor_loss = per.sum() / mask.sum().clamp(min=1.0)
+            anchor_loss_weighted = self.config.anchor_aux_weight * anchor_loss
+            aux_extra["anchor_loss"] = anchor_loss
+
         # Compute LM loss on prefix language tokens if enabled.
         if self.config.lm_loss_weight > 0 and lang_tokens is not None:
             lm_loss = self._compute_lm_loss(prefix_out, lang_tokens, lang_masks)
@@ -764,6 +824,8 @@ class PI0Pytorch(nn.Module):
                     + vae_loss_weighted
                     + next_state_loss_weighted
                     + latent_loss_weighted
+                    + deriv_loss_weighted
+                    + anchor_loss_weighted
                 ),
                 "flow_loss": flow_loss_mean,
                 "lm_loss": lm_loss,
@@ -783,6 +845,8 @@ class PI0Pytorch(nn.Module):
                     + vae_loss_weighted
                     + next_state_loss_weighted
                     + latent_loss_weighted
+                    + deriv_loss_weighted
+                    + anchor_loss_weighted
                 ),
                 "flow_loss": flow_loss_mean,
                 **(moe_losses or {}),

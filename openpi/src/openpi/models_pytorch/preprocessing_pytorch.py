@@ -171,4 +171,5 @@ def preprocess_observation_pytorch(
         reasoning_token_mask=getattr(observation, "reasoning_token_mask", None),
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        ee_physics_target=getattr(observation, "ee_physics_target", None),
     )

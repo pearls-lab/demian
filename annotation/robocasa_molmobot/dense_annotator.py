@@ -405,13 +405,10 @@ def make_side_by_side(left_path: str, right_path: str) -> str:
     """
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp.close()
-    filter_graph = (
-        "[0]drawtext=text='LEFT VIEW':fontsize=20:fontcolor=white"
-        ":x=10:y=10:box=1:boxcolor=black@0.6:boxborderw=4[l];"
-        "[1]drawtext=text='RIGHT VIEW':fontsize=20:fontcolor=white"
-        ":x=10:y=10:box=1:boxcolor=black@0.6:boxborderw=4[r];"
-        "[l][r]hstack[out]"
-    )
+    # NOTE: view labels dropped (2026-07-23) — the imageio-ffmpeg static build on
+    # this fleet has no drawtext filter, and prompts.json never references the
+    # labels. Left half = left agentview, right half = right agentview.
+    filter_graph = "[0][1]hstack[out]"
     subprocess.run(
         [
             "ffmpeg", "-y", "-loglevel", "error",
