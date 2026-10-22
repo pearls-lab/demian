@@ -5,10 +5,10 @@ description: Dense Multi-Aspect Annotation for scaling robot policy learning.
 img: assets/img/pearls-placeholder.png
 importance: 1
 category: World Modeling Embodied Agents
-venue: Preprint
+venue: NeurIPS
 year: 2026
 team: UCSD · NVIDIA
-authors: "<span class='me'>Bosung Kim</span><sup class='co'>★</sup>, <span class='me'>Ruiyi Wang</span><sup class='co'>★</sup>, David Acuna, Jaehun Jung, Alexander Trevithick, Brandon Cui, Yejin Choi, Prithviraj Ammanabrolu<br><span class='equal-contrib'>★ Equal contribution</span>"
+authors: "<a href='https://bosung.github.io' target='_blank' rel='noopener noreferrer'><span class='me'>Bosung Kim</span></a><sup class='co'>★</sup>, <span class='me'>Ruiyi Wang</span><sup class='co'>★</sup>, <a href='https://www.cs.toronto.edu/~davidj/' target='_blank' rel='noopener noreferrer'>David Acuna</a>, <a href='https://jaehunjung.com' target='_blank' rel='noopener noreferrer'>Jaehun Jung</a>, <a href='https://alextrevithick.com' target='_blank' rel='noopener noreferrer'>Alexander Trevithick</a>, Brandon Cui, <a href='https://yejinc.github.io' target='_blank' rel='noopener noreferrer'>Yejin Choi</a>, <a href='https://prithvirajva.com' target='_blank' rel='noopener noreferrer'>Prithviraj Ammanabrolu</a><br><span class='equal-contrib'>★ Equal contribution</span>"
 affiliations: "UCSD PEARLS Lab · NVIDIA Research — LACR & AMRI"
 paper_url: "https://arxiv.org/pdf/2605.17077"
 code_url: "https://github.com/pearls-lab/demian"

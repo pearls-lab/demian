@@ -7,7 +7,7 @@ description: "Dense Multi-Aspect Annotation for scaling robot policy learning."
 # For a PROJECT page (https://<org>.github.io/<repo>/) set baseurl to "/<repo>"
 # so `relative_url` resolves the asset paths. For a USER/ORG page
 # (https://<org>.github.io/) leave it empty.
-baseurl: "/demian_private"   # project page -> https://pearls-lab.github.io/demian_private/
+baseurl: "/demian"   # project page -> https://pearls-lab.github.io/demian/
 url: ""
 
 # Repo docs that should not become website pages.
